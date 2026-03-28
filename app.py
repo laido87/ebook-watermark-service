@@ -1,15 +1,19 @@
 """
 Watermark Service for "The Art of Practice" ebook.
 Deployed on Render.com (free tier, no credit card).
+
+v2: Signed URL downloads — generates PDF on-the-fly, no storage needed.
+    Links survive service restarts and never expire.
 """
 
 import io
 import os
-import uuid
-import time
+import hmac
+import hashlib
+import base64
 import tempfile
-import threading
-from datetime import datetime, timedelta
+from datetime import datetime
+
 from flask import Flask, request, jsonify, send_file, Response
 import fitz  # PyMuPDF
 import requests
@@ -24,27 +28,57 @@ GHL_EBOOK_FIELD_KEY = os.environ.get("GHL_EBOOK_FIELD_KEY", "contact.ebook_downl
 MASTER_PDF_URL = os.environ.get("MASTER_PDF_URL", "")
 BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:5000")
 WATERMARK_FONTSIZE = float(os.environ.get("WATERMARK_FONTSIZE", "9.5"))
-LINK_EXPIRY_DAYS = int(os.environ.get("LINK_EXPIRY_DAYS", "7"))
 FONT_URL = "https://github.com/google/fonts/raw/main/ofl/ebgaramond/EBGaramond%5Bwght%5D.ttf"
 
-# ---------- IN-MEMORY STORAGE ----------
-pdf_store = {}
-store_lock = threading.Lock()
+# ---------- CACHES ----------
 _master_pdf_cache = None
 _font_path = None
 
 
+# ---------- SIGNED URL HELPERS ----------
+def generate_signed_token(email):
+    """Generate a signed token encoding the buyer's email.
+    Format: base64url(email).hmac_hex_signature
+    """
+    email_b64 = base64.urlsafe_b64encode(email.encode()).decode().rstrip("=")
+    signature = hmac.new(
+        API_SECRET.encode(), email.encode(), hashlib.sha256
+    ).hexdigest()[:32]
+    return f"{email_b64}.{signature}"
+
+
+def verify_signed_token(token):
+    """Verify token and return the email, or None if invalid."""
+    parts = token.split(".")
+    if len(parts) != 2:
+        return None
+    email_b64, signature = parts
+    # Restore base64 padding
+    padding = 4 - len(email_b64) % 4
+    if padding != 4:
+        email_b64 += "=" * padding
+    try:
+        email = base64.urlsafe_b64decode(email_b64).decode()
+    except Exception:
+        return None
+    expected = hmac.new(
+        API_SECRET.encode(), email.encode(), hashlib.sha256
+    ).hexdigest()[:32]
+    if not hmac.compare_digest(signature, expected):
+        return None
+    return email
+
+
+# ---------- PDF HELPERS ----------
 def get_font_path():
     """Download and cache EB Garamond font from Google Fonts."""
     global _font_path
     if _font_path and os.path.exists(_font_path):
         return _font_path
-    # Check if bundled locally first
     local = os.path.join(os.path.dirname(__file__), "EBGaramond.ttf")
     if os.path.exists(local):
         _font_path = local
         return _font_path
-    # Download from Google Fonts
     print(f"[{datetime.utcnow()}] Downloading EB Garamond font...")
     resp = requests.get(FONT_URL, timeout=30)
     resp.raise_for_status()
@@ -78,6 +112,7 @@ def watermark_pdf(master_bytes, email):
     text = f"Licensed to: {email}"
     font = fitz.Font(fontfile=font_path)
     text_width = font.text_length(text, fontsize=fontsize)
+
     for page in doc:
         rect = page.rect
         w = rect.width
@@ -85,10 +120,15 @@ def watermark_pdf(master_bytes, email):
         x = (w - text_width) / 2
         y = h - 10
         page.insert_text(
-            fitz.Point(x, y), text,
-            fontfile=font_path, fontname="EBGaramond",
-            fontsize=fontsize, color=(0.5, 0.5, 0.5), overlay=True,
+            fitz.Point(x, y),
+            text,
+            fontfile=font_path,
+            fontname="EBGaramond",
+            fontsize=fontsize,
+            color=(0.5, 0.5, 0.5),
+            overlay=True,
         )
+
     output = io.BytesIO()
     doc.save(output, garbage=4, deflate=True)
     doc.close()
@@ -98,11 +138,13 @@ def watermark_pdf(master_bytes, email):
 def update_ghl_contact(email, download_url):
     if not GHL_API_KEY or not GHL_EBOOK_FIELD_KEY:
         return {"skipped": "GHL not configured"}
+
     headers = {
         "Authorization": f"Bearer {GHL_API_KEY}",
         "Content-Type": "application/json",
         "Version": "2021-07-28",
     }
+
     lookup_url = (
         f"https://services.leadconnectorhq.com/contacts/lookup"
         f"?locationId={GHL_LOCATION_ID}&email={email}"
@@ -110,110 +152,107 @@ def update_ghl_contact(email, download_url):
     resp = requests.get(lookup_url, headers=headers, timeout=15)
     if resp.status_code != 200:
         return {"error": f"Lookup failed: {resp.status_code}"}
+
     data = resp.json()
     contacts = data.get("contacts", [])
     if not contacts:
         return {"error": "Contact not found"}
+
     contact_id = contacts[0]["id"]
     update_url = f"https://services.leadconnectorhq.com/contacts/{contact_id}"
     update_resp = requests.put(
-        update_url, headers=headers,
+        update_url,
+        headers=headers,
         json={"customFields": [{"key": GHL_EBOOK_FIELD_KEY, "value": download_url}]},
         timeout=15,
     )
     return {"contact_id": contact_id, "updated": update_resp.status_code == 200}
 
 
-def cleanup_expired():
-    cutoff = datetime.utcnow() - timedelta(days=LINK_EXPIRY_DAYS)
-    with store_lock:
-        expired = [k for k, v in pdf_store.items() if v["created"] < cutoff]
-        for k in expired:
-            del pdf_store[k]
-    if expired:
-        print(f"[{datetime.utcnow()}] Cleaned up {len(expired)} expired PDFs")
-
-
-def start_cleanup_thread():
-    def loop():
-        while True:
-            time.sleep(3600)
-            cleanup_expired()
-    t = threading.Thread(target=loop, daemon=True)
-    t.start()
-
-
+# ---------- ROUTES ----------
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({
         "service": "Art of Practice Watermark Service",
         "status": "ok",
-        "active_downloads": len(pdf_store),
+        "version": "2.0-signed-urls",
     })
 
 
 @app.route("/watermark", methods=["POST"])
 def watermark():
+    """Generate a signed download URL for the buyer.
+    No PDF is stored - it gets generated on-the-fly when the link is clicked.
+    """
     try:
         data = request.get_json(silent=True) or {}
         email = data.get("email", "").strip().lower()
         secret = data.get("secret", "")
+
         if API_SECRET and secret != API_SECRET:
             return jsonify({"error": "Unauthorized"}), 403
         if not email or "@" not in email:
             return jsonify({"error": "Valid email required"}), 400
-        master = get_master_pdf()
-        pdf_bytes = watermark_pdf(master, email)
-        download_id = str(uuid.uuid4())
-        with store_lock:
-            pdf_store[download_id] = {
-                "pdf_bytes": pdf_bytes,
-                "email": email,
-                "created": datetime.utcnow(),
-            }
-        download_url = f"{BASE_URL}/download/{download_id}"
+
+        # Generate signed download token
+        token = generate_signed_token(email)
+        download_url = f"{BASE_URL}/dl/{token}"
+
+        # Update GHL contact with the permanent download link
         ghl_result = update_ghl_contact(email, download_url)
-        print(f"[{datetime.utcnow()}] Watermarked PDF for {email}")
+
+        print(f"[{datetime.utcnow()}] Signed download URL generated for {email}")
+
         return jsonify({
             "download_url": download_url,
             "email": email,
-            "download_id": download_id,
             "ghl_update": ghl_result,
         })
+
     except Exception as e:
         print(f"[{datetime.utcnow()}] ERROR: {e}")
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/download/<download_id>", methods=["GET"])
-def download(download_id):
-    with store_lock:
-        entry = pdf_store.get(download_id)
-    if not entry:
+@app.route("/dl/<token>", methods=["GET"])
+def download_signed(token):
+    """Verify the signed token, generate the watermarked PDF on-the-fly, and serve it.
+    No storage needed - the PDF is freshly generated each time.
+    Links never expire and survive service restarts.
+    """
+    email = verify_signed_token(token)
+    if not email:
         return Response(
-            "<html><body><h2>Download link expired</h2>"
-            "<p>Please contact laido@theartofpractice.com for a new link.</p>"
-            "</body></html>", status=404, content_type="text/html",
+            "<html><body><h2>Invalid download link</h2>"
+            "<p>Please contact laido@theartofpractice.com for help.</p>"
+            "</body></html>",
+            status=403,
+            content_type="text/html",
         )
-    if datetime.utcnow() - entry["created"] > timedelta(days=LINK_EXPIRY_DAYS):
-        with store_lock:
-            pdf_store.pop(download_id, None)
+
+    try:
+        master = get_master_pdf()
+        pdf_bytes = watermark_pdf(master, email)
+        print(f"[{datetime.utcnow()}] On-demand PDF generated for {email}")
+
+        return send_file(
+            io.BytesIO(pdf_bytes),
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name="The_Art_of_Practice.pdf",
+        )
+    except Exception as e:
+        print(f"[{datetime.utcnow()}] Download error for {email}: {e}")
         return Response(
-            "<html><body><h2>Download link expired</h2>"
-            "<p>Contact laido@theartofpractice.com for help.</p>"
-            "</body></html>", status=410, content_type="text/html",
+            "<html><body><h2>Temporary error</h2>"
+            "<p>Please try again in a moment. If the issue persists, "
+            "contact laido@theartofpractice.com.</p>"
+            "</body></html>",
+            status=500,
+            content_type="text/html",
         )
-    return send_file(
-        io.BytesIO(entry["pdf_bytes"]),
-        mimetype="application/pdf",
-        as_attachment=True,
-        download_name="The_Art_of_Practice.pdf",
-    )
 
-
-start_cleanup_thread()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
