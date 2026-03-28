@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: art-of-practice-watermark
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1
+    envVars:
+      - key: API_SECRET
+        sync: false
+      - key: GHL_API_KEY
+        sync: false
+      - key: GHL_LOCATION_ID
+        value: DbHHEJGE1RLMqU0unS6p
+      - key: GHL_EBOOK_FIELD_KEY
+        value: contact.ebook_download_link
+      - key: MASTER_PDF_URL
+        sync: false
+      - key: WATERMARK_FONTSIZE
+        value: "9.5"
+      - key: LINK_EXPIRY_DAYS
+        value: "7"
+      - key: PYTHON_VERSION
+        value: "3.11.0"
