@@ -1,0 +1,20 @@
+name: Keep Render Service Alive
+
+on:
+  schedule:
+    - cron: '*/14 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping watermark service
+        run: |
+          response=$(curl -s -o /dev/null -w "%{http_code}" https://art-of-practice-watermark.onrender.com/)
+          echo "Response code: $response"
+          if [ "$response" -ge 500 ]; then
+            echo "Service returned error: $response"
+            exit 1
+          fi
+          echo "Service is alive"
