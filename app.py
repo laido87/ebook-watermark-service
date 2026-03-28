@@ -1,30 +1,13 @@
 """
 Watermark Service for "The Art of Practice" ebook.
 Deployed on Render.com (free tier, no credit card).
-
-Flow:
-  1. ThriveCart purchase â Zapier webhook
-  2. Zapier POSTs { "email": "buyer@example.com", "secret": "..." } to this service
-  3. Service stamps "Licensed to: buyer@email.com" on every page (EB Garamond, 9.5pt)
-  4. Stores watermarked PDF in memory with a unique download ID
-  5. Updates GHL contact custom field with the download URL
-  6. Returns the download URL to Zapier
-  7. Customer clicks download link in GHL welcome email â gets their watermarked PDF
-
-Environment variables (set in Render dashboard):
-  API_SECRET       â shared secret to authenticate Zapier calls
-  GHL_API_KEY      â GoHighLevel API key
-  GHL_LOCATION_ID  â GHL location ID (default: DbHHEJGE1RLMqU0unS6p)
-  GHL_EBOOK_FIELD_KEY â GHL custom field key for download link
-  MASTER_PDF_URL   â Direct download URL for the master PDF (Dropbox/Google Drive)
-  RENDER_EXTERNAL_URL â Auto-set by Render (e.g., https://your-service.onrender.com)
-  WATERMARK_FONTSIZE â Font size for watermark (default: 9.5)
 """
 
 import io
 import os
 import uuid
 import time
+import tempfile
 import threading
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_file, Response
@@ -42,6 +25,7 @@ MASTER_PDF_URL = os.environ.get("MASTER_PDF_URL", "")
 BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:5000")
 WATERMARK_FONTSIZE = float(os.environ.get("WATERMARK_FONTSIZE", "9.5"))
 LINK_EXPIRY_DAYS = int(os.environ.get("LINK_EXPIRY_DAYS", "7"))
+FONT_URL = "https://github.com/google/fonts/raw/main/ofl/ebgaramond/EBGaramond%5Bwght%5D.ttf"
 
 # ---------- IN-MEMORY STORAGE ----------
 pdf_store = {}
@@ -51,14 +35,29 @@ _font_path = None
 
 
 def get_font_path():
+    """Download and cache EB Garamond font from Google Fonts."""
     global _font_path
-    if _font_path:
+    if _font_path and os.path.exists(_font_path):
         return _font_path
-    _font_path = os.path.join(os.path.dirname(__file__), "EBGaramond.ttf")
+    # Check if bundled locally first
+    local = os.path.join(os.path.dirname(__file__), "EBGaramond.ttf")
+    if os.path.exists(local):
+        _font_path = local
+        return _font_path
+    # Download from Google Fonts
+    print(f"[{datetime.utcnow()}] Downloading EB Garamond font...")
+    resp = requests.get(FONT_URL, timeout=30)
+    resp.raise_for_status()
+    tmp = os.path.join(tempfile.gettempdir(), "EBGaramond.ttf")
+    with open(tmp, "wb") as f:
+        f.write(resp.content)
+    _font_path = tmp
+    print(f"[{datetime.utcnow()}] Font cached at {tmp}")
     return _font_path
 
 
 def get_master_pdf():
+    """Download and cache the master PDF bytes."""
     global _master_pdf_cache
     if _master_pdf_cache:
         return io.BytesIO(_master_pdf_cache)
@@ -217,3 +216,4 @@ start_cleanup_thread()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
