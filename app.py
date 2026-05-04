@@ -105,11 +105,11 @@ def get_master_pdf():
     return io.BytesIO(_master_pdf_cache)
 
 
-def watermark_pdf(master_bytes, email):
+def watermark_pdf(master_bytes, email, display_name=None):
     font_path = get_font_path()
     fontsize = WATERMARK_FONTSIZE
     doc = fitz.open(stream=master_bytes.read(), filetype="pdf")
-    text = f"Licensed to: {email}"
+    text = f"Licensed to: {display_name} — {email}" if display_name else f"Licensed to: {email}"
     font = fitz.Font(fontfile=font_path)
     text_width = font.text_length(text, fontsize=fontsize)
 
@@ -133,6 +133,38 @@ def watermark_pdf(master_bytes, email):
     doc.save(output, garbage=4, deflate=True)
     doc.close()
     return output.getvalue()
+
+
+def lookup_ghl_name(email):
+    """Look up firstName/lastName for email via GHL v2 contacts API."""
+    if not GHL_API_KEY:
+        return None
+    try:
+        headers = {
+            "Authorization": f"Bearer {GHL_API_KEY}",
+            "Version": "2021-07-28",
+            "Accept": "application/json",
+        }
+        url = (
+            f"https://services.leadconnectorhq.com/contacts/"
+            f"?locationId={GHL_LOCATION_ID}&query={email}"
+        )
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            print(f"[{datetime.utcnow()}] GHL lookup failed: {resp.status_code} {resp.text[:200]}")
+            return None
+        data = resp.json() or {}
+        contacts = data.get("contacts") or []
+        if not contacts:
+            return None
+        c = contacts[0]
+        first = (c.get("firstName") or "").strip()
+        last = (c.get("lastName") or "").strip()
+        full = (first + " " + last).strip()
+        return full or None
+    except Exception as e:
+        print(f"[{datetime.utcnow()}] GHL lookup error: {e}")
+        return None
 
 
 def update_ghl_contact(email, download_url):
@@ -231,8 +263,9 @@ def download_signed(token):
         )
 
     try:
+        display_name = lookup_ghl_name(email)
         master = get_master_pdf()
-        pdf_bytes = watermark_pdf(master, email)
+        pdf_bytes = watermark_pdf(master, email, display_name)
         print(f"[{datetime.utcnow()}] On-demand PDF generated for {email}")
 
         return send_file(
