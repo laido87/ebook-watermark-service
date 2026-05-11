@@ -132,7 +132,7 @@ def watermark_pdf(master_bytes, email, display_name=None):
         )
 
     output = io.BytesIO()
-    doc.save(output, garbage=4, deflate=True)
+    doc.save(output)  # garbage=4, deflate=True removed for ~3-5s speedup per download
     doc.close()
     return output.getvalue()
 
