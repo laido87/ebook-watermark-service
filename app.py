@@ -4,6 +4,8 @@ Deployed on Render.com (free tier, no credit card).
 
 v2: Signed URL downloads — generates PDF on-the-fly, no storage needed.
     Links survive service restarts and never expire.
+
+    Cache-bust redeploy 2026-05-11T06:26:06.338554Z — refresh master PDF from Drive.
 """
 
 import io
